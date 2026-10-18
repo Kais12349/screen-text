@@ -1,0 +1,15 @@
+# Offline dependencies are distributed with the release archive.
+/runtime/
+/vendor/
+/cache/
+/checks/
+/dist/
+*.exe
+*.zip
+__pycache__/
+*.py[cod]
+.env
+.env.*
+# Local debugging scripts and notes.
+/ocr.ps1
+/使用说明.txt
