@@ -67,13 +67,21 @@ def recover_code_symbols(engine, gray, rows, bounds, positioned, pitch):
     import numpy as np
 
     height = statistics.median(r['height'] for r in rows)
-    _, mask = cv2.threshold(np.asarray(gray), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    threshold, mask = cv2.threshold(np.asarray(gray), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     # Remove editor guides, underlines and selection outlines, which otherwise
     # join a brace to a rectangle. Printed glyphs are shorter than these lines.
     clean = cv2.subtract(mask, cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                         np.ones((max(3, round(height*1.05)), 1), np.uint8)))
     clean = cv2.subtract(clean, cv2.morphologyEx(clean, cv2.MORPH_OPEN,
                         np.ones((1, max(3, round(pitch*2.2))), np.uint8)))
+    # Faint selection borders can be broken at each text baseline. Remove their
+    # low-contrast straight strokes even when they are shorter than a full row.
+    weak = ((np.asarray(gray) >= threshold-10) & (mask > 0)).astype('uint8')*255
+    weak_lines = cv2.morphologyEx(weak, cv2.MORPH_OPEN,
+                                np.ones((max(3, round(height*.7)), 1), np.uint8))
+    clean = cv2.subtract(clean, weak_lines)
+    cleaned_gray = np.asarray(gray).copy()
+    cleaned_gray[(mask > 0) & (clean == 0)] = 255
     _, labels, stats, _ = cv2.connectedComponentsWithStats(clean)
     glyphs = [(i, tuple(map(int, box))) for i, box in enumerate(stats[1:], 1)
               if box[4] >= 4 and box[2] <= height*1.4 and box[3] <= height*1.2]
@@ -101,7 +109,7 @@ def recover_code_symbols(engine, gray, rows, bounds, positioned, pitch):
             mirror = dict(zip('{}()[]', '}{)(]['))[char]
             templates.append((mirror, template[:, ::-1], glyph[1][2]/glyph[1][3]))
 
-    def classify(glyph):
+    def classify(glyph, limit=.23):
         _, (_, _, w, h, _) = glyph
         if h < height*.65 or not templates: return None
         candidate = shape(glyph)
@@ -116,7 +124,26 @@ def recover_code_symbols(engine, gray, rows, bounds, positioned, pitch):
         matches = [(float(np.mean(np.abs(candidate-t))) + abs(w/h-ratio)*.5, char)
                    for char, t, ratio in templates]
         distance, char = min(matches)
-        return (char, 1-distance) if distance < .23 else None
+        if distance >= limit: return None
+        if char in '{}':
+            # A round parenthesis bends broadly; a brace has a narrow central
+            # notch. This also works when there is no decoded parenthesis to
+            # use as a template elsewhere in this particular screenshot.
+            i, (x, y, _, _, _) = glyph
+            pixels = labels[y:y+h, x:x+w] == i
+            midpoints = [float(np.flatnonzero(line).mean()) for line in pixels if line.any()]
+            end_count = max(1, h//5)
+            ends = statistics.mean(midpoints[:end_count] + midpoints[-end_count:])
+            middle = statistics.mean(midpoints[h//2-1:h//2+2])
+            # Straight diagonal slashes have no central bend.
+            if abs(middle-ends) < w*.18: return None
+            char = '{' if middle < ends else '}'
+            edges = [np.flatnonzero(line)[0 if char == '{' else -1]
+                     for line in pixels if line.any()]
+            extreme = min(edges) if char == '{' else max(edges)
+            broad = sum(abs(edge-extreme) <= w*.2 for edge in edges)/len(edges)
+            if char == '}' and broad >= .5 and distance > .15: char = ')'
+        return char, 1-distance
 
     # Build additional rows only from real, matched punctuation components.
     extra = []
@@ -135,11 +162,14 @@ def recover_code_symbols(engine, gray, rows, bounds, positioned, pitch):
         return rows, bounds, positioned, None
 
     originals = {id(row): (row, bound, result) for row, bound, result in zip(rows, bounds, positioned)}
+    bright = (np.asarray(gray) < threshold*.85).astype('uint8')
+    _, _, bright_stats, _ = cv2.connectedComponentsWithStats(bright)
     recovered = []
     for row in sorted(rows + extra, key=lambda r: r['cy']):
         old = 'items' in row
         members = [g for g in glyphs if abs(g[1][1]+g[1][3]/2-row['cy']) < height*.45
-                   and (not old or row['x0']-height*1.5 <= g[1][0] <= row['x1']+height*1.5)]
+                   and (not old or (row['x0']-height*1.5 <= g[1][0] <= row['x1']+height*1.5
+                        and (g[1][0] >= row['x0']-pitch*.9 or g[1][2] > max(2,pitch*.3))))]
         if not members:
             if old: recovered.append(originals[id(row)])
             continue
@@ -162,15 +192,41 @@ def recover_code_symbols(engine, gray, rows, bounds, positioned, pitch):
             text = ''.join(c for c, _ in symbols)
             recovered.append((row, bound, (symbols, text, min(s[2] for s in row['symbols']))))
         else:
-            crop = gray.crop(bound)
+            from PIL import Image
+            crop = Image.fromarray(cleaned_gray).crop(bound)
             result = engine.text_rec([np.asarray(crop.resize((crop.width*3,crop.height*3)).convert('RGB'))], True)[0][0]
             text, score, (columns, words, positions, _, _) = result
             chars = [(c, bound[0]+(pos+.5)*(bound[2]-bound[0])/columns)
                      for word, locations in zip(words,positions) for c,pos in zip(word,locations)]
+            # An outlined mouse I-beam has detached bright dots above and below
+            # the baseline. A diagonal fragment beside its stem can still prove
+            # that the obscured character is a slash, even if OCR calls it M/1.
+            caps = [tuple(map(int, b)) for b in bright_stats[1:]
+                    if b[4] >= 2 and b[2] <= pitch*.45 and b[3] <= height*.35
+                    and abs(b[1]+b[3]/2-row['cy']) < height]
+            for ax, ay, aw, ah, _ in caps:
+                if ay > row['cy']-height*.35: continue
+                for bx, by, bw, bh, _ in caps:
+                    cx = ax+aw/2
+                    if not (height*.9 < by-ay < height*1.5
+                            and abs(bx+bw/2-cx) <= 1.5
+                            and by > row['cy']+height*.25): continue
+                    stem = mask[ay+ah:by, max(0,round(cx)-1):round(cx)+1]
+                    if not stem.size or np.mean(np.any(stem > 0,axis=1)) < .65: continue
+                    for fragment in members:
+                        gi, (fx, fy, fw, fh, _) = fragment
+                        if not (height*.3 <= fh < height*.75 and fw <= pitch*.6
+                                and cx-pitch < fx+fw/2 < cx-pitch*.25): continue
+                        ys, xs = np.where(labels[fy:fy+fh,fx:fx+fw] == gi)
+                        slope, intercept = np.polyfit(ys+fy, xs+fx, 1)
+                        if not -.8 < slope < -.15: continue
+                        slash_x = slope*(row['cy']-1)+intercept
+                        chars = [(c,x) for c,x in chars if abs(x-slash_x) >= pitch*.65]
+                        chars.append(('/',float(slash_x)))
             # Trust matched boundary glyphs over the recognizer's guess (often
             # a dot or a digit). Do not rewrite letters or symbols inside strings.
             for glyph in members:
-                match = classify(glyph)
+                match = classify(glyph, .34)
                 _, (gx, gy, gw, gh, _) = glyph
                 if (match is None and quote_templates and text.count("'") % 2
                         and gh <= height*.35 and gw <= pitch*.4
