@@ -30,6 +30,12 @@ def group_rows(results):
     return sorted(rows, key=lambda r: r['cy'])
 
 
+def looks_like_markup(line):
+    # Detection may merge a tag name with its first attribute or miss the
+    # closing angle bracket. Keep those rows in the position-aware code path.
+    return bool(re.match(r'^\s*<(?:/?[A-Za-z][\w:.-]*(?:\s|[/>=]|$)|!--|!DOCTYPE\b)', line, re.I))
+
+
 def looks_like_code(rows):
     lines = [' '.join(i['text'] for i in r['items']) for r in rows]
     pattern = r'(^\s*(def\s*\w+|class\s*\w+\s*\(|import\s+|from\s+\w+|@\w+\.|\w+\.\w+\())|[{};]\s*$|\w+_\w+\('
@@ -42,7 +48,8 @@ def looks_like_code(rows):
     assignments = sum(bool(re.fullmatch(r'\s*' + identifier + r'(?:\s*[=三一]\s*|\s+)' + identifier + r'\s*', line)) for line in lines)
     js_object = any(re.match(r'^\s*(?:const|let|var)\s+[\w$]+\s*=\s*\{', line) for line in lines)
     properties = sum(bool(re.match(r'^\s*[A-Za-z_$][\w$]*\s*:', line)) for line in lines)
-    return strong >= 2 or (strong >= 1 and fields >= 2) or assignments >= 2 or (js_object and properties >= 2)
+    return (any(looks_like_markup(line) for line in lines) or strong >= 2
+            or (strong >= 1 and fields >= 2) or assignments >= 2 or (js_object and properties >= 2))
 
 
 def plain_text(rows):
@@ -257,8 +264,10 @@ def code_text(engine, image, rows):
     for row in rows:
         detected = ' '.join(item['text'] for item in row['items'])
         # A detector can drop a trailing quote or narrow symbol. Extend only
-        # incomplete quoted rows, keeping the usual crop and positions stable.
-        right_margin = row['height']*1.5 if any(detected.count(q) % 2 for q in ('"', "'")) else 1
+        # incomplete quoted/tag rows. Read the pixels beyond the detection box;
+        # do not synthesize a closing tag or infer it from syntax.
+        incomplete_tag = looks_like_markup(detected) and not detected.rstrip().endswith('>')
+        right_margin = row['height']*1.5 if incomplete_tag or any(detected.count(q) % 2 for q in ('"', "'")) else 1
         bounds.append((max(0, math.floor(row['x0'])-1), max(0, math.floor(row['y0'])-1),
                        min(image.width, math.ceil(row['x1'] + right_margin)), min(image.height, math.ceil(row['y1'])+1)))
         crop = gray.crop(bounds[-1])
