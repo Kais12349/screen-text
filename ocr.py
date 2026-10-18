@@ -35,7 +35,12 @@ def looks_like_code(rows):
     pattern = r'(^\s*(def\s*\w+|class\s*\w+\s*\(|import\s+|from\s+\w+|@\w+\.|\w+\.\w+\())|[{};]\s*$|\w+_\w+\('
     strong = sum(bool(re.search(pattern, line)) for line in lines)
     fields = sum(bool(re.match(r'^\s*\w+\s*:\s*(?:str|int|float|bool|list|dict|set|tuple|Optional|Union)\b', line)) for line in lines)
-    return strong >= 2 or (strong >= 1 and fields >= 2)
+    # Assignment-only snippets have no class/def header. The first pass may
+    # miss an equals sign; repeated pairs of dotted identifiers still identify
+    # this layout without treating prose or a lone address as source code.
+    identifier = r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+'
+    assignments = sum(bool(re.fullmatch(r'\s*' + identifier + r'(?:\s*[=三一]\s*|\s+)' + identifier + r'\s*', line)) for line in lines)
+    return strong >= 2 or (strong >= 1 and fields >= 2) or assignments >= 2
 
 
 def plain_text(rows):
@@ -98,28 +103,40 @@ def code_text(engine, image, rows):
     ink_lefts, bars_by_row, cursors_by_row = [], [], []
     for row, bound in zip(rows, bounds):
         mask = foreground[bound[1]:bound[3], bound[0]:bound[2]]
-        _, _, components, centers = cv2.connectedComponentsWithStats(mask)
+        _, labels, components, centers = cv2.connectedComponentsWithStats(mask)
         ink = [(box, center) for box, center in zip(components[1:], centers[1:]) if box[4] >= 4]
-        ink_lefts.append(bound[0] + min((box[0] for box, _ in ink), default=0))
         bars_by_row.append([bound[0] + center[0] for box, center in ink
                             if box[2] <= max(2, pitch*.35) and box[3] >= pitch*1.6
                             and box[4] >= box[3]*.65])
         # An outlined I-beam has a detached central stroke and four small caps.
         # These disconnected caps distinguish it from a printed I, l, 1, or |.
         cursors = []
-        for box, center in ink:
+        for component_id, box in enumerate(components[1:], 1):
             x, y, w, h, area = box
-            if w > pitch*.3 or not pitch*1.2 <= h <= pitch*2.2: continue
+            if area < 4 or w > pitch*.7 or not pitch*1.2 <= h <= pitch*2.2: continue
+            # Some cursor caps connect to the stem after resampling. Measure
+            # its middle rather than requiring the entire component be narrow.
+            middle = labels[y+h//3:y+2*h//3, x:x+w] == component_id
+            core = np.flatnonzero(np.count_nonzero(middle, axis=0) >= middle.shape[0]*.8)
+            if not len(core) or core[-1]-core[0]+1 > pitch*.3: continue
+            stem_x = x + (core[0]+core[-1]+1)/2
             caps = set()
             for cap in components[1:]:
                 cx, cy, cw, ch, ca = cap
                 if ca < 2 or cw > pitch*.4 or ch > pitch*.35: continue
-                dx = cx + cw/2 - center[0]
+                dx = cx + cw/2 - stem_x
                 if not pitch*.15 <= abs(dx) <= pitch*.6: continue
                 if abs(cy-y) <= pitch*.3: caps.add(('top', dx > 0))
                 if abs(cy+ch-y-h) <= pitch*.3: caps.add(('bottom', dx > 0))
-            if len(caps) >= 3: cursors.append(bound[0] + center[0])
+            if len(caps) >= 2 and {end for end, _ in caps} == {'top', 'bottom'}:
+                cursors.append(bound[0] + stem_x)
         cursors_by_row.append(cursors)
+        # A mouse cursor to the left of a line must not shift every other line's
+        # indentation. Ignore only the cursor's own stem and detached caps.
+        text_ink = [box for box, _ in ink if not any(
+            box[0]+bound[0] >= cursor-pitch*.7 and box[0]+box[2]+bound[0] <= cursor+pitch*.6
+            for cursor in cursors)]
+        ink_lefts.append(bound[0] + min((box[0] for box in text_ink), default=0))
     left = min(ink_lefts)
     deltas = [b['cy']-a['cy'] for a,b in zip(rows, rows[1:]) if b['cy'] > a['cy']]
     line_pitch = statistics.median(deltas) if deltas else rows[0]['height']*1.4
@@ -134,7 +151,7 @@ def code_text(engine, image, rows):
         # Recover a vertical stroke from pixels only, rather than replacing every
         # I/l/1 in identifiers, strings, and numeric literals.
         characters = [(c, x) for c, x in characters
-                      if not (c in 'I1l工|丨｜' and any(abs(x-cursor) < pitch*.7 for cursor in cursors))]
+                      if not (c in 'TI1l工|丨｜' and any(abs(x-cursor) < pitch*.7 for cursor in cursors))]
         if cursors and not any(not c.isspace() for c, _ in characters): continue
         if previous_row:
             lines.extend([''] * min(8, max(0, round((row['cy']-previous_row['cy'])/line_pitch)-1)))
@@ -158,7 +175,9 @@ def code_text(engine, image, rows):
                 # Decoder positions can drift by a fraction of a character cell.
                 # Bias toward the smaller gap to avoid inventing a second space.
                 missing = math.floor((x-xa-expected)/pitch + .25)
-                boundary = (a.isalnum() and c.isalnum() and a.isascii() and c.isascii()) or (a == '#' and c.isalnum()) or (a.isalnum() and c == '{')
+                boundary = ((a.isalnum() and c.isalnum() and a.isascii() and c.isascii())
+                            or (a == '#' and c.isalnum()) or (a.isalnum() and c == '{')
+                            or a in '=<>!+*/%&|^-' or c in '=<>!+*/%&|^-')
                 if had_space and (not a.isascii() or not c.isascii()):
                     output += ' '
                 elif (boundary or had_space) and x-xa > expected + pitch*.6 and missing > 0:
