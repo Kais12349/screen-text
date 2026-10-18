@@ -4,7 +4,9 @@ Windows 离线截图取字小工具。框选屏幕，识别中英文、数字和
 
 ## 下载使用
 
-从 [Releases](https://github.com/Kais12349/screen-text/releases) 下载 `screen-text-windows-x64.zip`，将整个文件夹解压到 **D 盘、E 盘等非 C 盘**，双击 `截图取字.exe`。
+首次使用：从 [v0.1.0](https://github.com/Kais12349/screen-text/releases/tag/v0.1.0) 下载完整的 `screen-text-windows-x64.zip`，将整个文件夹解压到 **D 盘、E 盘等非 C 盘**。再从 [最新 Release](https://github.com/Kais12349/screen-text/releases/latest) 下载 `screen-text-update-版本号.zip`，将包内文件覆盖到工具目录，双击 `截图取字.exe`。
+
+已有工具：退出工具后，直接覆盖最新更新包中的文件，再启动即可；保留原目录的 `runtime` 和 `vendor`。
 
 便携包包含 Python 运行环境、OCR 模型和依赖，不需要安装 Python，不需要 API 密钥，运行时无需联网。请保留 `runtime`、`vendor` 和 `ocr.py`，不要只移动 exe。
 
@@ -19,6 +21,7 @@ Windows 离线截图取字小工具。框选屏幕，识别中英文、数字和
 
 - 使用 RapidOCR / PP-OCRv4 本地模型，支持中文、英文、数字和标点。
 - 对常见代码截图，结合文字位置保留行序、空行、缩进和下划线，并改善 Python 类定义、类型标注中空格与 `|` 的识别。支持连续属性赋值代码，改善高亮背景下的等号、运算符间距及鼠标光标干扰。
+- 对只含括号的短行，结合原图中的字符形状补识别花括号、圆括号、方括号及相邻的逗号、分号，改善 JavaScript 配置截图中的符号漏行、行边界裁切和引号遗漏。不依据语法补写原图中不存在的闭合括号。
 - 输出可编辑的纯文本；小字、模糊文字、复杂背景、引号以及 `l / 1`、`O / 0` 等仍需人工检查，不保证逐字符准确。
 - 本工具的临时图片与识别结果只写入工具目录的 `cache`，识别结束后删除；不上传截图、不保存识别历史。
 - 本工具及 OCR 子进程的 `TEMP` / `TMP` 指向该目录。Windows 自身的日志、系统文件由操作系统管理。

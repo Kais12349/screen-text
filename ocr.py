@@ -40,7 +40,9 @@ def looks_like_code(rows):
     # this layout without treating prose or a lone address as source code.
     identifier = r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+'
     assignments = sum(bool(re.fullmatch(r'\s*' + identifier + r'(?:\s*[=三一]\s*|\s+)' + identifier + r'\s*', line)) for line in lines)
-    return strong >= 2 or (strong >= 1 and fields >= 2) or assignments >= 2
+    js_object = any(re.match(r'^\s*(?:const|let|var)\s+[\w$]+\s*=\s*\{', line) for line in lines)
+    properties = sum(bool(re.match(r'^\s*[A-Za-z_$][\w$]*\s*:', line)) for line in lines)
+    return strong >= 2 or (strong >= 1 and fields >= 2) or assignments >= 2 or (js_object and properties >= 2)
 
 
 def plain_text(rows):
@@ -57,6 +59,133 @@ def plain_text(rows):
             previous = item
         lines.append(line)
     return '\n'.join(lines)
+
+
+def recover_code_symbols(engine, gray, rows, bounds, positioned, pitch):
+    """Find short symbol rows using glyphs in this image, never bracket balance."""
+    import cv2
+    import numpy as np
+
+    height = statistics.median(r['height'] for r in rows)
+    _, mask = cv2.threshold(np.asarray(gray), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Remove editor guides, underlines and selection outlines, which otherwise
+    # join a brace to a rectangle. Printed glyphs are shorter than these lines.
+    clean = cv2.subtract(mask, cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                        np.ones((max(3, round(height*1.05)), 1), np.uint8)))
+    clean = cv2.subtract(clean, cv2.morphologyEx(clean, cv2.MORPH_OPEN,
+                        np.ones((1, max(3, round(pitch*2.2))), np.uint8)))
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(clean)
+    glyphs = [(i, tuple(map(int, box))) for i, box in enumerate(stats[1:], 1)
+              if box[4] >= 4 and box[2] <= height*1.4 and box[3] <= height*1.2]
+
+    def shape(glyph):
+        i, (x, y, w, h, _) = glyph
+        return cv2.resize((labels[y:y+h, x:x+w] == i).astype('float32'), (12, 28))
+
+    templates, quote_templates = [], []
+    for row, bound, (characters, _, score) in zip(rows, bounds, positioned):
+        for char, px in characters:
+            if char == "'" and score >= .9:
+                nearby = [g for g in glyphs if g[1][3] <= height*.35 and g[1][2] <= pitch*.4
+                          and abs(g[1][0]+g[1][2]/2-px) < pitch*.6
+                          and row['y0']-2 <= g[1][1] <= row['cy']-height*.15]
+                if nearby:
+                    quote_templates.append(shape(min(nearby, key=lambda g: abs(g[1][0]+g[1][2]/2-px))))
+            if char not in '{}()[]' or score < .9: continue
+            nearby = [g for g in glyphs if abs(g[1][1]+g[1][3]/2-row['cy']) < height*.4
+                      and abs(g[1][0]+g[1][2]/2-px) < pitch*.55 and g[1][3] >= height*.65]
+            if not nearby: continue
+            glyph = min(nearby, key=lambda g: abs(g[1][0]+g[1][2]/2-px))
+            template = shape(glyph)
+            templates.append((char, template, glyph[1][2]/glyph[1][3]))
+            mirror = dict(zip('{}()[]', '}{)(]['))[char]
+            templates.append((mirror, template[:, ::-1], glyph[1][2]/glyph[1][3]))
+
+    def classify(glyph):
+        _, (_, _, w, h, _) = glyph
+        if h < height*.65 or not templates: return None
+        candidate = shape(glyph)
+        # Square brackets also have a distinctive straight stem and two caps.
+        # They may have no correctly decoded exemplar anywhere in the image.
+        if .15 <= w/h <= .6 and min(candidate[:3].mean(), candidate[-3:].mean()) > .75:
+            middle = candidate[6:-6]
+            if middle[:, :3].mean() > .65 and middle[:, -4:].mean() < .1:
+                return '[', .94
+            if middle[:, -3:].mean() > .65 and middle[:, :4].mean() < .1:
+                return ']', .94
+        matches = [(float(np.mean(np.abs(candidate-t))) + abs(w/h-ratio)*.5, char)
+                   for char, t, ratio in templates]
+        distance, char = min(matches)
+        return (char, 1-distance) if distance < .23 else None
+
+    # Build additional rows only from real, matched punctuation components.
+    extra = []
+    for glyph in sorted(glyphs, key=lambda g: g[1][1]):
+        _, (x, y, w, h, _) = glyph
+        cy = y+h/2
+        if any(abs(cy-r['cy']) < height*.6 for r in rows): continue
+        match = classify(glyph)
+        if match is None: continue
+        row = next((r for r in extra if abs(r['cy']-cy) < height*.4), None)
+        if row is None:
+            row = dict(cy=cy, symbols=[], height=height)
+            extra.append(row)
+        row['symbols'].append((match[0], x+w/2, match[1]))
+    if not extra:
+        return rows, bounds, positioned, None
+
+    originals = {id(row): (row, bound, result) for row, bound, result in zip(rows, bounds, positioned)}
+    recovered = []
+    for row in sorted(rows + extra, key=lambda r: r['cy']):
+        old = 'items' in row
+        members = [g for g in glyphs if abs(g[1][1]+g[1][3]/2-row['cy']) < height*.45
+                   and (not old or row['x0']-height*1.5 <= g[1][0] <= row['x1']+height*1.5)]
+        if not members:
+            if old: recovered.append(originals[id(row)])
+            continue
+        if not old and any(g[1][3] >= height*.4 and classify(g) is None for g in members):
+            continue
+        x0, y0 = min(g[1][0] for g in members), min(g[1][1] for g in members)
+        x1, y1 = max(g[1][0]+g[1][2] for g in members), max(g[1][1]+g[1][3] for g in members)
+        bound = (max(0,x0-2), max(0,y0-2), min(gray.width,x1+2), min(gray.height,y1+2))
+        row = dict(row, x0=x0, y0=y0, x1=x1, y1=y1)
+        if not old:
+            # Tiny commas are disconnected from the main closing brace.
+            symbols = [(c, x) for c, x, _ in row['symbols']]
+            small = [g[1] for g in members if g[1][3] < height*.4 and g[1][2] <= pitch*.6]
+            for gx, gy, gw, gh, _ in small:
+                if gy <= row['cy']: continue
+                has_dot = any(abs(sx+sw/2-gx-gw/2) < pitch*.35 and sy < row['cy']
+                              for sx,sy,sw,sh,_ in small)
+                symbols.append((';' if has_dot else ',', gx+gw/2))
+            symbols.sort(key=lambda p:p[1])
+            text = ''.join(c for c, _ in symbols)
+            recovered.append((row, bound, (symbols, text, min(s[2] for s in row['symbols']))))
+        else:
+            crop = gray.crop(bound)
+            result = engine.text_rec([np.asarray(crop.resize((crop.width*3,crop.height*3)).convert('RGB'))], True)[0][0]
+            text, score, (columns, words, positions, _, _) = result
+            chars = [(c, bound[0]+(pos+.5)*(bound[2]-bound[0])/columns)
+                     for word, locations in zip(words,positions) for c,pos in zip(word,locations)]
+            # Trust matched boundary glyphs over the recognizer's guess (often
+            # a dot or a digit). Do not rewrite letters or symbols inside strings.
+            for glyph in members:
+                match = classify(glyph)
+                _, (gx, gy, gw, gh, _) = glyph
+                if (match is None and quote_templates and text.count("'") % 2
+                        and gh <= height*.35 and gw <= pitch*.4
+                        and gy <= y0+height*.25 and gx > x1-pitch):
+                    distance = min(float(np.mean(np.abs(shape(glyph)-t))) for t in quote_templates)
+                    if distance < .36: match = ("'", 1-distance)
+                if match is None: continue
+                px = gx+gw/2
+                if px < x1-pitch*1.2: continue
+                chars = [(c,x) for c,x in chars if abs(x-px) >= pitch*.65]
+                chars.append((match[0],px))
+            recovered.append((row, bound, (chars, text, score)))
+    if not any('symbols' in r[0] for r in recovered):
+        return rows, bounds, positioned, None
+    return ([r[0] for r in recovered], [r[1] for r in recovered], [r[2] for r in recovered], clean)
 
 
 def code_text(engine, image, rows):
@@ -100,6 +229,9 @@ def code_text(engine, image, rows):
     pitch = statistics.median(span_samples or pitch_samples) if (span_samples or pitch_samples) else statistics.median(r['height'] for r in rows)*.5
     pitch = max(pitch, 1)
     _, foreground = cv2.threshold(np.asarray(gray), 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    rows, bounds, positioned, recovered_mask = recover_code_symbols(engine, gray, rows, bounds, positioned, pitch)
+    if recovered_mask is not None:
+        foreground = recovered_mask
     ink_lefts, bars_by_row, cursors_by_row = [], [], []
     for row, bound in zip(rows, bounds):
         mask = foreground[bound[1]:bound[3], bound[0]:bound[2]]
@@ -177,6 +309,7 @@ def code_text(engine, image, rows):
                 missing = math.floor((x-xa-expected)/pitch + .25)
                 boundary = ((a.isalnum() and c.isalnum() and a.isascii() and c.isascii())
                             or (a == '#' and c.isalnum()) or (a.isalnum() and c == '{')
+                            or a in ':,'
                             or a in '=<>!+*/%&|^-' or c in '=<>!+*/%&|^-')
                 if had_space and (not a.isascii() or not c.isascii()):
                     output += ' '
